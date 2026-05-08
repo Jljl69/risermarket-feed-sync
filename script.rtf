@@ -1,0 +1,243 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2869
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 /**\
+ * RiserMarket \'b7 Sync Novedades \uc0\u8594  feed.json\
+ * \
+ * Scrapea https://www.risermarket.com/es/listado-productos/novedades/3\
+ * y genera /data/feed.json con la estructura que consume el men\'fa.\
+ * \
+ * Ejecuci\'f3n: node scripts/sync-novedades.js\
+ * Dry-run:   node scripts/sync-novedades.js --dry-run\
+ */\
+\
+import fetch from 'node-fetch';\
+import * as cheerio from 'cheerio';\
+import \{ writeFile, mkdir \} from 'fs/promises';\
+import \{ existsSync \} from 'fs';\
+import path from 'path';\
+\
+// ============================================================\
+// CONFIGURACI\'d3N\
+// ============================================================\
+const CONFIG = \{\
+  sourceUrl: 'https://www.risermarket.com/es/listado-productos/novedades/3',\
+  outputPath: 'data/feed.json',\
+  maxPerCategory: 3,           // hasta 3 productos por categor\'eda (rotaci\'f3n)\
+  totalLimit: 60,              // tope global de productos a guardar\
+  userAgent: 'RiserMarketFeedBot/1.0 (+https://www.risermarket.com)',\
+  timeoutMs: 25000,\
+  dryRun: process.argv.includes('--dry-run')\
+\};\
+\
+// Mapeo: slug de categor\'eda destino del producto \uc0\u8594  key del men\'fa\
+// (basado en las URLs reales /c/\{slug\}/\{id\} de RiserMarket)\
+const CATEGORY_MAP = \{\
+  'telefonos':            'telefonos',\
+  'telefonia-y-gps':      'telefonos',\
+  'reloj-smartwatch':     'telefonos',\
+  'cargadores-portatil':  'perifericos',\
+  'cargador-de-dispositivos-moviles': 'perifericos',\
+  'tablet':               'tablet',\
+  'tablets-e-book':       'tablet',\
+  'monitores':            'pcs',\
+  'pcs-portatiles':       'pcs',\
+  'portatiles-equipos':   'pcs',\
+  'componentes':          'componentes',\
+  'procesadores':         'componentes',\
+  'tarjetas-graficas':    'componentes',\
+  'torres-cajas-carcasas':'componentes',\
+  'perifericos':          'perifericos',\
+  'impresoras-multifuncion':'perifericos',\
+  'auriculares':          'audio',\
+  'microfonos-y-auriculares':'audio',\
+  'imagen-y-sonido':      'audio',\
+  'mandos-a-distancia':   'audio',\
+  'redes':                'redes',\
+  'hogar':                'hogar',\
+  'consolas':             'consolas',\
+  'antivirus-seguridad':  'software',\
+  'particulares':         'software'\
+\};\
+\
+// ============================================================\
+// SCRAPING\
+// ============================================================\
+async function fetchHtml(url) \{\
+  console.log(`\uc0\u55357 \u56589  Fetching $\{url\}...`);\
+  const ctrl = new AbortController();\
+  const timer = setTimeout(() => ctrl.abort(), CONFIG.timeoutMs);\
+  \
+  try \{\
+    const res = await fetch(url, \{\
+      headers: \{\
+        'User-Agent': CONFIG.userAgent,\
+        'Accept': 'text/html,application/xhtml+xml',\
+        'Accept-Language': 'es-ES,es;q=0.9'\
+      \},\
+      signal: ctrl.signal\
+    \});\
+    if (!res.ok) throw new Error(`HTTP $\{res.status\}`);\
+    return await res.text();\
+  \} finally \{\
+    clearTimeout(timer);\
+  \}\
+\}\
+\
+function parseProducts(html) \{\
+  const $ = cheerio.load(html);\
+  const products = [];\
+  \
+  // RiserMarket / LiveCommerce: cada producto est\'e1 en un contenedor con\
+  // clases tipo .product-list-item o estructura repetida con enlace al producto\
+  // Extraemos por bloques que contengan /producto/\{slug\}/\{id\}\
+  \
+  $('a[href*="/producto/"]').each((_, el) => \{\
+    const $a = $(el);\
+    const href = $a.attr('href');\
+    \
+    // Saltamos im\'e1genes/iconos, queremos el enlace que tiene el t\'edtulo\
+    const title = ($a.attr('title') || $a.text() || '').trim();\
+    if (!href || !title || title.length < 8) return;\
+    \
+    // Buscamos hacia arriba el contenedor del producto\
+    const $card = $a.closest('div, li, article').filter((_, c) => \{\
+      return $(c).find('a[href*="/c/"]').length > 0; // tiene link a categor\'eda\
+    \}).first();\
+    \
+    if (!$card.length) return;\
+    \
+    // Marca: alt del logo de marca o texto cercano\
+    const $brandLogo = $card.find('img[src*="MarcasLogo"]').first();\
+    const brand = $brandLogo.attr('alt') || extractBrandFromTitle(title) || 'RiserMarket';\
+    \
+    // Precio: buscamos el primer texto que parece "X,XX \'80"\
+    const cardText = $card.text();\
+    const priceMatch = cardText.match(/(\\d\{1,3\}(?:\\.\\d\{3\})*(?:,\\d\{2\})?)\\s*\'80/);\
+    const price = priceMatch ? `$\{priceMatch[1]\} \'80` : null;\
+    if (!price) return;\
+    \
+    // Categor\'eda destino: buscar el link /c/\{slug\}/\{id\}\
+    const $catLink = $card.find('a[href*="/c/"]').first();\
+    const catHref = $catLink.attr('href') || '';\
+    const catSlugMatch = catHref.match(/\\/c\\/([^\\/]+)\\//);\
+    const catSlug = catSlugMatch ? catSlugMatch[1] : null;\
+    if (!catSlug) return;\
+    \
+    const menuKey = CATEGORY_MAP[catSlug];\
+    if (!menuKey) return; // categor\'eda no mapeada \uc0\u8594  skip\
+    \
+    // ID del producto desde la URL\
+    const idMatch = href.match(/\\/(\\d+)\\/?$/);\
+    const productId = idMatch ? idMatch[1] : null;\
+    \
+    // Limpiar t\'edtulo (quitar HTML entities)\
+    const cleanTitle = title.replace(/&quot;/g, '"').replace(/\\s+/g, ' ').trim();\
+    \
+    // Evitar duplicados por ID\
+    if (products.some(p => p.id === productId)) return;\
+    \
+    products.push(\{\
+      id: productId,\
+      cat: menuKey,\
+      catSlug,\
+      brand: brand.trim(),\
+      name: cleanTitle,\
+      price,\
+      href: href.startsWith('http') ? href : `https://www.risermarket.com$\{href\}`\
+    \});\
+  \});\
+  \
+  return products;\
+\}\
+\
+function extractBrandFromTitle(title) \{\
+  const brands = ['Samsung', 'Apple', 'Xiaomi', 'AISENS', 'ASUS', 'MSI', 'Lenovo', \
+                  'Energy Sistem', 'Ewent', 'Kaspersky', 'Norton', 'Bitdefender', \
+                  'HP', 'Dell', 'Acer', 'Logitech', 'Microsoft', 'Sony', 'TP-Link'];\
+  return brands.find(b => title.toLowerCase().includes(b.toLowerCase()));\
+\}\
+\
+// ============================================================\
+// AGRUPADO Y SELECCI\'d3N\
+// ============================================================\
+function buildFeed(products) \{\
+  const grouped = \{\};\
+  \
+  for (const p of products) \{\
+    if (!grouped[p.cat]) grouped[p.cat] = [];\
+    if (grouped[p.cat].length < CONFIG.maxPerCategory) \{\
+      grouped[p.cat].push(p);\
+    \}\
+  \}\
+  \
+  // Aplanar manteniendo el primero de cada categor\'eda como featured\
+  const allFlat = [];\
+  Object.entries(grouped).forEach(([cat, items]) => \{\
+    items.forEach(p => allFlat.push(p));\
+  \});\
+  \
+  return \{\
+    generatedAt: new Date().toISOString(),\
+    generatedAtMadrid: new Date().toLocaleString('es-ES', \{ timeZone: 'Europe/Madrid' \}),\
+    source: CONFIG.sourceUrl,\
+    totalProducts: allFlat.length,\
+    categoriesFound: Object.keys(grouped),\
+    products: allFlat.slice(0, CONFIG.totalLimit)\
+  \};\
+\}\
+\
+// ============================================================\
+// MAIN\
+// ============================================================\
+async function main() \{\
+  console.log('\uc0\u55357 \u56960  RiserMarket Feed Sync');\
+  console.log(`   Mode: $\{CONFIG.dryRun ? 'DRY-RUN' : 'WRITE'\}`);\
+  console.log(`   Source: $\{CONFIG.sourceUrl\}\\n`);\
+  \
+  try \{\
+    const html = await fetchHtml(CONFIG.sourceUrl);\
+    console.log(`\uc0\u9989  HTML descargado: $\{(html.length/1024).toFixed(1)\} KB`);\
+    \
+    const products = parseProducts(html);\
+    console.log(`\uc0\u9989  Productos parseados: $\{products.length\}`);\
+    \
+    if (products.length === 0) \{\
+      throw new Error('Sin productos extra\'eddos. Posible cambio en estructura HTML.');\
+    \}\
+    \
+    const feed = buildFeed(products);\
+    console.log(`\uc0\u9989  Feed construido: $\{feed.totalProducts\} productos en $\{feed.categoriesFound.length\} categor\'edas`);\
+    console.log(`   Categor\'edas: $\{feed.categoriesFound.join(', ')\}\\n`);\
+    \
+    // Mostrar muestra\
+    console.log('\uc0\u55357 \u56523  Muestra (primeros 5):');\
+    feed.products.slice(0, 5).forEach(p => \{\
+      console.log(`   [$\{p.cat.padEnd(12)\}] $\{p.brand.padEnd(15)\} \'b7 $\{p.name.slice(0,50)\}... \'b7 $\{p.price\}`);\
+    \});\
+    \
+    if (CONFIG.dryRun) \{\
+      console.log('\\n\uc0\u55357 \u56632  DRY-RUN: no se escribe archivo.');\
+      return;\
+    \}\
+    \
+    // Crear directorio si no existe\
+    const dir = path.dirname(CONFIG.outputPath);\
+    if (!existsSync(dir)) await mkdir(dir, \{ recursive: true \});\
+    \
+    await writeFile(CONFIG.outputPath, JSON.stringify(feed, null, 2), 'utf8');\
+    console.log(`\\n\uc0\u9989  Guardado: $\{CONFIG.outputPath\}`);\
+    console.log(`   Tama\'f1o: $\{(JSON.stringify(feed).length/1024).toFixed(1)\} KB`);\
+    \
+  \} catch (err) \{\
+    console.error(`\\n\uc0\u10060  ERROR: $\{err.message\}`);\
+    console.error(err.stack);\
+    process.exit(1);\
+  \}\
+\}\
+\
+main();}

@@ -1,0 +1,72 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2869
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 name: Sync RiserMarket Feed\
+\
+on:\
+  schedule:\
+    # 06:00 Madrid (CET = UTC+1, CEST = UTC+2)\
+    # Usamos 04:00 UTC para que coincida con ~05:00-06:00 Madrid seg\'fan horario\
+    - cron: '0 4 * * *'\
+  workflow_dispatch:  # permite ejecuci\'f3n manual desde la web\
+    inputs:\
+      dry_run:\
+        description: 'Dry-run sin escribir archivo'\
+        type: boolean\
+        default: false\
+\
+permissions:\
+  contents: write\
+\
+jobs:\
+  sync:\
+    runs-on: ubuntu-latest\
+    timeout-minutes: 5\
+    steps:\
+      - name: Checkout\
+        uses: actions/checkout@v4\
+\
+      - name: Setup Node\
+        uses: actions/setup-node@v4\
+        with:\
+          node-version: '20'\
+          cache: 'npm'\
+\
+      - name: Install dependencies\
+        run: npm ci\
+\
+      - name: Run sync\
+        run: |\
+          if [ "$\{\{ inputs.dry_run \}\}" = "true" ]; then\
+            npm run test\
+          else\
+            npm run sync\
+          fi\
+\
+      - name: Commit feed.json\
+        if: $\{\{ inputs.dry_run != 'true' \}\}\
+        run: |\
+          git config user.name 'github-actions[bot]'\
+          git config user.email 'github-actions[bot]@users.noreply.github.com'\
+          git add data/feed.json\
+          if git diff --staged --quiet; then\
+            echo "Sin cambios en feed.json, nada que commitear."\
+          else\
+            git commit -m "\uc0\u55358 \u56598  Auto-sync feed novedades $(date -u +'%Y-%m-%d %H:%M UTC')"\
+            git push\
+          fi\
+\
+      - name: Summary\
+        if: always()\
+        run: |\
+          echo "### \uc0\u55357 \u56550  Resultado" >> $GITHUB_STEP_SUMMARY\
+          if [ -f data/feed.json ]; then\
+            COUNT=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/feed.json')).totalProducts)")\
+            echo "- \uc0\u9989  Feed actualizado: **$COUNT productos**" >> $GITHUB_STEP_SUMMARY\
+            echo "- \uc0\u55357 \u56517  Generado: $(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY\
+            echo "- \uc0\u55357 \u56599  [Ver feed.json](https://raw.githubusercontent.com/$\{\{ github.repository \}\}/main/data/feed.json)" >> $GITHUB_STEP_SUMMARY\
+          fi}
